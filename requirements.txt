@@ -1,1 +1,2 @@
 redfish>=3.1.0
+hpeOneView>=6.0.0

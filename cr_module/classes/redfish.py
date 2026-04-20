@@ -14,7 +14,7 @@ import json
 import pprint
 import sys
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from cr_module.common import grab
 from cr_module.classes import plugin_status_types
@@ -44,6 +44,7 @@ class RedfishConnection:
     vendor_data = None
     cli_args = None
     desired_session_file_mode = 0o600
+    oneview_session_file_path = None
 
     def __init__(self, cli_args=None):
 
@@ -59,6 +60,9 @@ class RedfishConnection:
             self.session_file_path = self.get_session_file_name()
             self.session_file_lock = self.session_file_path + ".lock"
             self.restore_session_from_file()
+
+            if self._is_oneview_mode():
+                self.oneview_session_file_path = self.get_oneview_session_file_name()
 
         self.init_connection()
 
@@ -336,6 +340,174 @@ class RedfishConnection:
 
         return
 
+    def _is_oneview_mode(self):
+        return bool(
+            getattr(self.cli_args, "oneview_host", None) and
+            getattr(self.cli_args, "oneview_server", None)
+        )
+
+    def get_oneview_session_file_name(self):
+        default_session_file_prefix = "check_redfish_ov"
+        default_session_file_suffix = ".ov_session"
+
+        session_file_dir = self.cli_args.sessionfiledir or tempfile.gettempdir()
+
+        if not os.path.exists(session_file_dir):
+            try:
+                os.makedirs(session_file_dir, 0o700)
+            except Exception as e:
+                self.exit_on_error(f"Unable to create session file directory: {session_file_dir}: {e}")
+
+        try:
+            current_user_id = os.getuid()
+        except Exception:
+            current_user_id = None
+
+        ov_host_safe = self.cli_args.oneview_host.replace(":", "_")
+        if current_user_id is not None:
+            filename = f"{default_session_file_prefix}_{current_user_id}_{ov_host_safe}"
+        else:
+            filename = f"{default_session_file_prefix}_{ov_host_safe}"
+
+        return os.path.normpath(session_file_dir) + os.sep + filename + default_session_file_suffix
+
+    def restore_oneview_session_from_file(self):
+        if self.oneview_session_file_path is None:
+            return None
+
+        session_data = None
+        try:
+            with open(self.oneview_session_file_path, "rb") as f:
+                session_data = pickle.load(f)
+        except (FileNotFoundError, EOFError):
+            return None
+        except PermissionError as e:
+            self.exit_on_error(f"Error opening OneView session file: {e}")
+        except Exception as e:
+            self.exit_on_error(f"Unknown exception reading OneView session file: {e}")
+
+        if not isinstance(session_data, dict):
+            return None
+
+        token = session_data.get("token")
+        server_uri = session_data.get("server_uri")
+        ov_host = session_data.get("host")
+
+        if not token or not server_uri or not ov_host:
+            return None
+
+        try:
+            from hpeOneView.oneview_client import OneViewClient
+            ov_client = OneViewClient({"ip": ov_host})
+            ov_client.connection.set_session_id(token)
+            # Validate session is still alive
+            ov_client.server_hardware.get(server_uri)
+            return ov_client, server_uri
+        except Exception:
+            return None
+
+    def save_oneview_session_to_file(self, ov_token, server_uri):
+        if self.oneview_session_file_path is None:
+            return
+
+        data = {
+            "token": ov_token,
+            "server_uri": server_uri,
+            "host": self.cli_args.oneview_host,
+        }
+
+        umask_original = os.umask(0o777 ^ self.desired_session_file_mode)
+        try:
+            fd = os.open(self.oneview_session_file_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                         self.desired_session_file_mode)
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(data, f)
+        except Exception as e:
+            self.exit_on_error(f"Unable to save OneView session to file: {e}")
+        finally:
+            os.umask(umask_original)
+
+    def login_with_oneview(self):
+        self.get_credentials()
+
+        # Try to restore existing OV session
+        restored = self.restore_oneview_session_from_file()
+        if restored is not None:
+            ov_client, server_uri = restored
+        else:
+            if self.username is None or self.password is None:
+                self.exit_on_error(
+                    "Username and password are required for OneView authentication.", "UNKNOWN")
+
+            try:
+                from hpeOneView.oneview_client import OneViewClient
+                ov_client = OneViewClient({
+                    "ip": self.cli_args.oneview_host,
+                    "credentials": {
+                        "userName": self.username,
+                        "password": self.password,
+                    },
+                })
+            except Exception as e:
+                self.exit_on_error(
+                    f"Unable to connect to OneView '{self.cli_args.oneview_host}': {e}", "CRITICAL")
+
+            # Find server by name filter
+            try:
+                servers = ov_client.server_hardware.get_all(
+                    filter=f"name='{self.cli_args.oneview_server}'"
+                )
+            except Exception as e:
+                self.exit_on_error(
+                    f"Failed to query OneView server hardware: {e}", "CRITICAL")
+
+            if not servers:
+                self.exit_on_error(
+                    f"Server '{self.cli_args.oneview_server}' not found in OneView '{self.cli_args.oneview_host}'.",
+                    "UNKNOWN")
+
+            server_uri = servers[0].get("uri")
+            if server_uri is None:
+                self.exit_on_error(
+                    f"Server '{self.cli_args.oneview_server}' has no URI in OneView response.", "UNKNOWN")
+
+            ov_token = ov_client.connection.get_session_id()
+            self.save_oneview_session_to_file(ov_token, server_uri)
+
+        # Get iLO SSO URL from OneView
+        try:
+            sso_data = ov_client.server_hardware.get_ilo_sso_url(server_uri)
+        except Exception as e:
+            self.exit_on_error(f"Failed to get iLO SSO URL from OneView: {e}", "CRITICAL")
+
+        sso_url = sso_data.get("iloSsoUrl") if isinstance(sso_data, dict) else None
+        if not sso_url:
+            self.exit_on_error("OneView returned empty iLO SSO URL.", "CRITICAL")
+
+        parsed = urlparse(sso_url)
+        session_key = parse_qs(parsed.query).get("sessionKey", [None])[0]
+        if not session_key:
+            self.exit_on_error(
+                f"Could not extract sessionKey from OneView SSO URL: {sso_url}", "CRITICAL")
+
+        self.connection.set_session_key(session_key)
+
+        # Best-effort: find session location for proper logout
+        try:
+            sessions_data = self.connection.get("/redfish/v1/SessionService/Sessions/", None)
+            if sessions_data and sessions_data.status == 200:
+                members = sessions_data.dict.get("Members", [])
+                if members:
+                    # Take the last member (most recently created)
+                    session_location = members[-1].get("@odata.id")
+                    if session_location:
+                        self.connection.set_session_location(
+                            f"https://{self.cli_args.host}{session_location}"
+                        )
+        except Exception:
+            pass
+
     @staticmethod
     def _is_safe_redirect(redirect_url, original_host):
         """Validate redirect URL is safe and appropriate for Redfish sessions."""
@@ -472,7 +644,9 @@ class RedfishConnection:
         if not self.connection:
             raise Exception("Unable to establish connection.")
 
-        if self.username is not None or self.password is not None:
+        if self._is_oneview_mode():
+            self.login_with_oneview()
+        elif self.username is not None or self.password is not None:
             try:
                 self.login_with_redirect_handling()
             except redfish.rest.v1.RetriesExhaustedError:

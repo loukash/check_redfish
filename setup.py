@@ -12,6 +12,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'redfish>=3.1.0',
+        'hpeOneView>=6.0.0',
     ],
     classifiers=[
         'License :: OSI Approved :: MIT License',

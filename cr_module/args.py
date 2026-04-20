@@ -35,6 +35,12 @@ def parse_command_line(description: str, version: str, version_date: str):
     group.add_argument("--nosession", action='store_true',
                        help="Don't establish a persistent session and log out after check is finished")
 
+    group = parser.add_argument_group(title="OneView authentication arguments")
+    group.add_argument("--oneview_host",
+                       help="hostname or IP of the HPE OneView appliance")
+    group.add_argument("--oneview_server",
+                       help="server name (filter) in OneView to look up the iLO SSO session")
+
     group = parser.add_argument_group(title="optional arguments")
     group.add_argument("-h", "--help", action='store_true',
                        help="show this help message and exit")
