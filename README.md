@@ -53,7 +53,10 @@ There is also an InfluxDB dashboard for some metrics included.
 usage: check_redfish.py [-H HOST] [-u USERNAME] [-p PASSWORD] [-f AUTHFILE]
                         [--sessionfile SESSIONFILE]
                         [--sessionfiledir SESSIONFILEDIR] [--sessionlock]
-                        [--nosession] [-h] [-w WARNING] [-c CRITICAL] [-v]
+                        [--nosession]
+                        [--oneview_host ONEVIEW_HOST]
+                        [--oneview_server ONEVIEW_SERVER]
+                        [-h] [-w WARNING] [-c CRITICAL] [-v]
                         [-d] [-m MAX] [-r RETRIES] [-t TIMEOUT]
                         [--log_exclude LOG_EXCLUDE] [--ignore_missing_ps]
                         [--ignore_unavailable_resources]
@@ -90,6 +93,13 @@ authentication arguments:
                         when connecting
   --nosession           Don't establish a persistent session and log out after
                         check is finished
+
+OneView authentication arguments:
+  --oneview_host ONEVIEW_HOST
+                        hostname or IP of the HPE OneView appliance
+  --oneview_server ONEVIEW_SERVER
+                        server name (filter) in OneView to look up the iLO SSO
+                        session
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -188,6 +198,36 @@ these two environment vars will be checked
 export CHECK_REDFISH_USERNAME=icinga
 export CHECK_REDFISH_PASSWORD=readonlysecret
 ```
+
+#### HPE OneView SSO
+If the server is managed by HPE OneView, you can authenticate via SSO instead of
+providing direct iLO credentials. In this mode the plugin connects to OneView using
+the standard `-u`/`-p`/`-f` credentials, finds the server by name, retrieves a
+one-time SSO session key for the iLO and uses it as the Redfish `X-Auth-Token`.
+No iLO user account is required on the monitoring side.
+
+Add `--oneview_host` and `--oneview_server` to enable this mode:
+```bash
+check_redfish.py -H 10.0.0.23 \
+  --oneview_host oneview.example.com \
+  --oneview_server "My Server Name" \
+  -u administrator -p secret \
+  --storage --power
+```
+
+The OneView session token is persisted to a separate pickle file (next to the
+regular Redfish session file) so repeated checks reuse the existing OneView session
+without re-authenticating on every run.
+
+**Requirements**
+* `hpeOneView >= 6.0.0` Python library (`pip install hpeOneView`)
+* The OneView user must have the *Server Administrator* (read-only is sufficient) role
+
+**Notes**
+* `--oneview_server` is matched as an exact name filter in OneView
+* Session files are stored in the same directory as regular Redfish sessions
+  (configurable with `--sessionfiledir`)
+* Use `--nosession` to skip session persistence (useful for one-off runs or testing)
 
 ### Sessions and session resumption
 To avoid delays due to login on every request and flooding the event log with
