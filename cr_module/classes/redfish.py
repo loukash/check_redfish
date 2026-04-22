@@ -46,7 +46,6 @@ class RedfishConnection:
     cli_args = None
     desired_session_file_mode = 0o600
     oneview_session_file_path = None
-    _ov_client_cache = None
 
     def __init__(self, cli_args=None):
 
@@ -410,8 +409,10 @@ class RedfishConnection:
             ov_client = OneViewClient(ov_cfg)
             ov_client.connection.set_session_id(token)
             # Validate session is still alive
-            ov_client.server_hardware.get(server_uri)
-            return ov_client, server_uri
+            server = ov_client.server_hardware.get_by_uri(server_uri)
+            if server is None:
+                return None
+            return ov_client, server
         except Exception:
             return None
 
@@ -471,19 +472,16 @@ class RedfishConnection:
                 f"Unable to connect to OneView '{self.cli_args.oneview_host}': {e}", "CRITICAL")
 
         try:
-            servers = ov_client.server_hardware.get_all(
-                filter=f"name='{self.cli_args.oneview_server}'"
-            )
+            server = ov_client.server_hardware.get_by_name(self.cli_args.oneview_server)
         except Exception as e:
             self.exit_on_error(f"Failed to query OneView server hardware: {e}", "CRITICAL")
 
-        if not servers:
+        if server is None:
             self.exit_on_error(
                 f"Server '{self.cli_args.oneview_server}' not found in OneView '{self.cli_args.oneview_host}'.",
                 "UNKNOWN")
 
-        server_data = servers[0]
-        server_uri = server_data.get("uri")
+        server_uri = server.data.get("uri")
         if server_uri is None:
             self.exit_on_error(
                 f"Server '{self.cli_args.oneview_server}' has no URI in OneView response.", "UNKNOWN")
@@ -491,12 +489,12 @@ class RedfishConnection:
         ov_token = ov_client.connection.get_session_id()
         self.save_oneview_session_to_file(ov_token, server_uri)
 
-        return ov_client, server_data
+        return ov_client, server
 
     @staticmethod
-    def _extract_ilo_host(server_data):
-        """Extract iLO IP address from OneView server hardware data (mpHostInfo)."""
-        mp_host_info = server_data.get("mpHostInfo") or {}
+    def _extract_ilo_host(server):
+        """Extract iLO IP address from OneView server hardware resource object."""
+        mp_host_info = (server.data or {}).get("mpHostInfo") or {}
 
         hostname = mp_host_info.get("mpHostName")
         if hostname:
@@ -513,27 +511,19 @@ class RedfishConnection:
 
         return None
 
-    def login_with_oneview(self):
-        # Reuse OV client from host discovery if available (avoids double login)
-        cached = getattr(self, "_ov_client_cache", None)
-        if cached is not None:
-            ov_client, server_data = cached
-            self._ov_client_cache = None
-        else:
-            ov_client, server_data = self._connect_to_oneview()
-        server_uri = server_data.get("uri")
+    def _get_ov_sso_token(self, server):
+        """Get iLO Redfish session key via OneView SSO. Returns sessionKey string."""
 
-        # Get iLO SSO URL from OneView
+        # Get SSO URL from OneView using the library's proper method
         try:
-            sso_data = ov_client.server_hardware.get_ilo_sso_url(server_uri)
+            sso_url = server.get_ilo_sso_url()
         except Exception as e:
             self.exit_on_error(f"Failed to get iLO SSO URL from OneView: {e}", "CRITICAL")
 
-        sso_url = sso_data.get("iloSsoUrl") if isinstance(sso_data, dict) else None
         if not sso_url:
             self.exit_on_error("OneView returned empty iLO SSO URL.", "CRITICAL")
 
-        # Step 1: extract KEY from the SSO URL query params
+        # Extract KEY from SSO URL query params
         parsed_sso = urlparse(sso_url)
         qs = parse_qs(parsed_sso.query)
         key = (qs.get("KEY") or qs.get("sessionKey") or [None])[0]
@@ -541,8 +531,8 @@ class RedfishConnection:
             self.exit_on_error(
                 f"Could not extract KEY from OneView SSO URL: {sso_url}", "CRITICAL")
 
-        # Step 2: GET the SSO URL with X-Auth-Token: KEY to activate session on iLO.
-        # iLO responds with a Set-Cookie / Location header containing the final sessionKey.
+        # GET SSO URL with X-Auth-Token: KEY to activate the session on iLO.
+        # iLO responds with sessionKey in response headers (Set-Cookie or Location).
         session_key = None
         try:
             sso_response = requests.get(
@@ -552,7 +542,6 @@ class RedfishConnection:
                 allow_redirects=True,
                 timeout=self.cli_args.timeout,
             )
-            # Search all response headers (including redirect chain) for sessionKey
             for resp in sso_response.history + [sso_response]:
                 for header_value in resp.headers.values():
                     match = re.search(r'sessionKey=([^;&\s]+)', header_value)
@@ -568,9 +557,12 @@ class RedfishConnection:
             self.exit_on_error(
                 "Could not obtain sessionKey after activating OneView SSO on iLO.", "CRITICAL")
 
+        return session_key
+
+    def _apply_sso_session(self, session_key):
+        """Set session key on Redfish connection and find session location via MySession."""
         self.connection.set_session_key(session_key)
 
-        # Find the correct session location via MySession == true for proper logout
         try:
             sessions_resp = self.connection.get("/redfish/v1/SessionService/Sessions/", None)
             if sessions_resp and sessions_resp.status == 200:
@@ -708,42 +700,73 @@ class RedfishConnection:
 
         self.get_credentials()
 
-        # In OneView mode without an explicit -H: discover iLO host from OV server hardware
-        if self._is_oneview_mode() and not self.cli_args.host:
-            ov_client, server_data = self._connect_to_oneview()
-            self._ov_client_cache = (ov_client, server_data)
+        if self._is_oneview_mode():
+            # Step 1: Connect to OV (restore or fresh login), get server resource object
+            ov_client, server = self._connect_to_oneview()
 
-            ilo_host = self._extract_ilo_host(server_data)
-            if not ilo_host:
-                self.exit_on_error(
-                    f"Could not determine iLO host address for server "
-                    f"'{self.cli_args.oneview_server}' from OneView.", "UNKNOWN")
-            self.cli_args.host = ilo_host
+            # Step 2: Discover iLO host if -H was not provided
+            if not self.cli_args.host:
+                ilo_host = self._extract_ilo_host(server)
+                if not ilo_host:
+                    self.exit_on_error(
+                        f"Could not determine iLO host address for server "
+                        f"'{self.cli_args.oneview_server}' from OneView.", "UNKNOWN")
+                self.cli_args.host = ilo_host
 
-            # Now that host is known, try to restore existing Redfish session
+                # Now that host is known, try to restore existing Redfish session
+                if self.cli_args.nosession is False:
+                    self.session_file_path = self.get_session_file_name()
+                    self.session_file_lock = self.session_file_path + ".lock"
+                    self.restore_session_from_file()
+
+                # Validate restored session
+                if self.connection is not None:
+                    redfish_version = tuple(map(int, redfish.__version__.split(".")))
+                    if len(redfish_version) >= 2 and redfish_version[0] >= 3 and redfish_version[1] >= 1:
+                        if not hasattr(self.connection, "_session"):
+                            self.connection = None
+                    else:
+                        if not hasattr(self.connection, "_conn"):
+                            self.connection = None
+
+                # Valid Redfish session — skip OV SSO
+                if self.connection is not None:
+                    self.remove_session_lock()
+                    return
+
+            # Step 3: Get SSO token from OV BEFORE creating Redfish client
+            self.write_session_lock()
+            session_key = self._get_ov_sso_token(server)
+
+            # Step 4: Create Redfish client
+            try:
+                self.connection = redfish.redfish_client(
+                    base_url=f"https://{self.cli_args.host}",
+                    max_retry=self.cli_args.retries, timeout=self.cli_args.timeout)
+            except redfish.rest.v1.ServerDownOrUnreachableError:
+                self.exit_on_error(f"iLO '{self.cli_args.host}' down or unreachable.", "CRITICAL")
+            except redfish.rest.v1.RetriesExhaustedError:
+                self.exit_on_error(f"Unable to connect to iLO '{self.cli_args.host}', max retries exhausted.",
+                                   "CRITICAL")
+            except Exception as e:
+                self.exit_on_error(f"Unable to connect to iLO '{self.cli_args.host}': {e}", "CRITICAL")
+
+            if not self.connection:
+                raise Exception("Unable to establish Redfish connection.")
+
+            # Step 5: Apply SSO token and find session location
+            self._apply_sso_session(session_key)
+
+            # Step 6: Save session
+            self.connection.system_properties = None
             if self.cli_args.nosession is False:
-                self.session_file_path = self.get_session_file_name()
-                self.session_file_lock = self.session_file_path + ".lock"
-                self.restore_session_from_file()
-
-            # Validate restored session (same checks as at top of init_connection)
-            if self.connection is not None:
-                redfish_version = tuple(map(int, redfish.__version__.split(".")))
-                if len(redfish_version) >= 2 and redfish_version[0] >= 3 and redfish_version[1] >= 1:
-                    if not hasattr(self.connection, "_session"):
-                        self.connection = None
-                else:
-                    if not hasattr(self.connection, "_conn"):
-                        self.connection = None
-
-            # Valid Redfish session restored — no need for OV SSO
-            if self.connection is not None:
-                self.remove_session_lock()
-                return
+                self.save_session_to_file()
+            self.remove_session_lock()
+            return
 
         self.write_session_lock()
 
-        # initialize connection
+        # initialize connection (non-OV mode)
         try:
             self.connection = redfish.redfish_client(base_url=f"https://{self.cli_args.host}",
                                                      max_retry=self.cli_args.retries, timeout=self.cli_args.timeout)
@@ -758,9 +781,7 @@ class RedfishConnection:
         if not self.connection:
             raise Exception("Unable to establish connection.")
 
-        if self._is_oneview_mode():
-            self.login_with_oneview()
-        elif self.username is not None or self.password is not None:
+        if self.username is not None or self.password is not None:
             try:
                 self.login_with_redirect_handling()
             except redfish.rest.v1.RetriesExhaustedError:
