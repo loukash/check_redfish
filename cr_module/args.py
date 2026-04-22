@@ -124,7 +124,7 @@ def parse_command_line(description: str, version: str, version_date: str):
 
     # need to check this our self otherwise it's not
     # possible to put the help command into an arguments group
-    if result.host is None:
-        parser.error("No remote host defined")
+    if result.host is None and not (result.oneview_host and result.oneview_server):
+        parser.error("No remote host defined. Provide -H or both --oneview_host and --oneview_server.")
 
     return result

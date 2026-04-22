@@ -45,24 +45,29 @@ class RedfishConnection:
     cli_args = None
     desired_session_file_mode = 0o600
     oneview_session_file_path = None
+    _ov_client_cache = None
 
     def __init__(self, cli_args=None):
 
         if cli_args is None:
             raise Exception("No args passed to RedfishConnection()")
 
-        if cli_args.host is None:
+        # In OneView mode the host is discovered from OV later; otherwise it must be set now
+        if cli_args.host is None and not (
+                getattr(cli_args, "oneview_host", None) and getattr(cli_args, "oneview_server", None)):
             raise Exception("cli args host not set")
 
         self.cli_args = cli_args
 
-        if self.cli_args.nosession is False:
-            self.session_file_path = self.get_session_file_name()
-            self.session_file_lock = self.session_file_path + ".lock"
-            self.restore_session_from_file()
-
-            if self._is_oneview_mode():
+        if self._is_oneview_mode():
+            # Host may not be known yet — session file init is deferred to after host discovery
+            if self.cli_args.nosession is False:
                 self.oneview_session_file_path = self.get_oneview_session_file_name()
+        else:
+            if self.cli_args.nosession is False:
+                self.session_file_path = self.get_session_file_name()
+                self.session_file_lock = self.session_file_path + ".lock"
+                self.restore_session_from_file()
 
         self.init_connection()
 
@@ -428,52 +433,88 @@ class RedfishConnection:
         finally:
             os.umask(umask_original)
 
-    def login_with_oneview(self):
+    def _connect_to_oneview(self):
+        """Connect to OneView (or restore session), find server hardware, return (ov_client, server_data)."""
         self.get_credentials()
 
-        # Try to restore existing OV session
         restored = self.restore_oneview_session_from_file()
         if restored is not None:
             ov_client, server_uri = restored
+            try:
+                server_data = ov_client.server_hardware.get(server_uri)
+                return ov_client, server_data
+            except Exception:
+                pass  # Session expired, fall through to fresh login
+
+        if self.username is None or self.password is None:
+            self.exit_on_error(
+                "Username and password are required for OneView authentication.", "UNKNOWN")
+
+        try:
+            from hpeOneView.oneview_client import OneViewClient
+            ov_client = OneViewClient({
+                "ip": self.cli_args.oneview_host,
+                "credentials": {
+                    "userName": self.username,
+                    "password": self.password,
+                },
+            })
+        except Exception as e:
+            self.exit_on_error(
+                f"Unable to connect to OneView '{self.cli_args.oneview_host}': {e}", "CRITICAL")
+
+        try:
+            servers = ov_client.server_hardware.get_all(
+                filter=f"name='{self.cli_args.oneview_server}'"
+            )
+        except Exception as e:
+            self.exit_on_error(f"Failed to query OneView server hardware: {e}", "CRITICAL")
+
+        if not servers:
+            self.exit_on_error(
+                f"Server '{self.cli_args.oneview_server}' not found in OneView '{self.cli_args.oneview_host}'.",
+                "UNKNOWN")
+
+        server_data = servers[0]
+        server_uri = server_data.get("uri")
+        if server_uri is None:
+            self.exit_on_error(
+                f"Server '{self.cli_args.oneview_server}' has no URI in OneView response.", "UNKNOWN")
+
+        ov_token = ov_client.connection.get_session_id()
+        self.save_oneview_session_to_file(ov_token, server_uri)
+
+        return ov_client, server_data
+
+    @staticmethod
+    def _extract_ilo_host(server_data):
+        """Extract iLO IP address from OneView server hardware data (mpHostInfo)."""
+        mp_host_info = server_data.get("mpHostInfo") or {}
+
+        hostname = mp_host_info.get("mpHostName")
+        if hostname:
+            return hostname
+
+        addresses = mp_host_info.get("mpIpAddresses") or []
+        # Prefer Static over DHCP; skip link-local (169.254.x.x)
+        for preferred_type in ("Static", "DHCP", "Unconfigured"):
+            for entry in addresses:
+                if entry.get("type") == preferred_type:
+                    addr = entry.get("address", "")
+                    if addr and not addr.startswith("169.254"):
+                        return addr
+
+        return None
+
+    def login_with_oneview(self):
+        # Reuse OV client from host discovery if available (avoids double login)
+        cached = getattr(self, "_ov_client_cache", None)
+        if cached is not None:
+            ov_client, server_data = cached
+            self._ov_client_cache = None
         else:
-            if self.username is None or self.password is None:
-                self.exit_on_error(
-                    "Username and password are required for OneView authentication.", "UNKNOWN")
-
-            try:
-                from hpeOneView.oneview_client import OneViewClient
-                ov_client = OneViewClient({
-                    "ip": self.cli_args.oneview_host,
-                    "credentials": {
-                        "userName": self.username,
-                        "password": self.password,
-                    },
-                })
-            except Exception as e:
-                self.exit_on_error(
-                    f"Unable to connect to OneView '{self.cli_args.oneview_host}': {e}", "CRITICAL")
-
-            # Find server by name filter
-            try:
-                servers = ov_client.server_hardware.get_all(
-                    filter=f"name='{self.cli_args.oneview_server}'"
-                )
-            except Exception as e:
-                self.exit_on_error(
-                    f"Failed to query OneView server hardware: {e}", "CRITICAL")
-
-            if not servers:
-                self.exit_on_error(
-                    f"Server '{self.cli_args.oneview_server}' not found in OneView '{self.cli_args.oneview_host}'.",
-                    "UNKNOWN")
-
-            server_uri = servers[0].get("uri")
-            if server_uri is None:
-                self.exit_on_error(
-                    f"Server '{self.cli_args.oneview_server}' has no URI in OneView response.", "UNKNOWN")
-
-            ov_token = ov_client.connection.get_session_id()
-            self.save_oneview_session_to_file(ov_token, server_uri)
+            ov_client, server_data = self._connect_to_oneview()
+        server_uri = server_data.get("uri")
 
         # Get iLO SSO URL from OneView
         try:
@@ -499,7 +540,6 @@ class RedfishConnection:
             if sessions_data and sessions_data.status == 200:
                 members = sessions_data.dict.get("Members", [])
                 if members:
-                    # Take the last member (most recently created)
                     session_location = members[-1].get("@odata.id")
                     if session_location:
                         self.connection.set_session_location(
@@ -627,6 +667,25 @@ class RedfishConnection:
             return
 
         self.get_credentials()
+
+        # In OneView mode without an explicit -H: discover iLO host from OV server hardware
+        if self._is_oneview_mode() and not self.cli_args.host:
+            ov_client, server_data = self._connect_to_oneview()
+            self._ov_client_cache = (ov_client, server_data)
+
+            ilo_host = self._extract_ilo_host(server_data)
+            if not ilo_host:
+                self.exit_on_error(
+                    f"Could not determine iLO host address for server "
+                    f"'{self.cli_args.oneview_server}' from OneView.", "UNKNOWN")
+            self.cli_args.host = ilo_host
+
+            # Now that host is known, initialise Redfish session file
+            if self.cli_args.nosession is False:
+                self.session_file_path = self.get_session_file_name()
+                self.session_file_lock = self.session_file_path + ".lock"
+                self.restore_session_from_file()
+
         self.write_session_lock()
 
         # initialize connection
