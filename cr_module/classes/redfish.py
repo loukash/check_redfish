@@ -8,6 +8,7 @@
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
 import os
+import re
 import tempfile
 import pickle
 import json
@@ -526,25 +527,58 @@ class RedfishConnection:
         if not sso_url:
             self.exit_on_error("OneView returned empty iLO SSO URL.", "CRITICAL")
 
-        parsed = urlparse(sso_url)
-        session_key = parse_qs(parsed.query).get("sessionKey", [None])[0]
+        # Step 1: extract KEY from the SSO URL query params
+        parsed_sso = urlparse(sso_url)
+        qs = parse_qs(parsed_sso.query)
+        key = (qs.get("KEY") or qs.get("sessionKey") or [None])[0]
+        if not key:
+            self.exit_on_error(
+                f"Could not extract KEY from OneView SSO URL: {sso_url}", "CRITICAL")
+
+        # Step 2: GET the SSO URL with X-Auth-Token: KEY to activate session on iLO.
+        # iLO responds with a Set-Cookie / Location header containing the final sessionKey.
+        session_key = None
+        try:
+            sso_response = requests.get(
+                sso_url,
+                headers={"X-Auth-Token": key, "Content-Type": "application/json"},
+                verify=False,
+                allow_redirects=True,
+                timeout=self.cli_args.timeout,
+            )
+            # Search all response headers (including redirect chain) for sessionKey
+            for resp in sso_response.history + [sso_response]:
+                for header_value in resp.headers.values():
+                    match = re.search(r'sessionKey=([^;&\s]+)', header_value)
+                    if match:
+                        session_key = match.group(1)
+                        break
+                if session_key:
+                    break
+        except Exception as e:
+            self.exit_on_error(f"Failed to activate iLO SSO session: {e}", "CRITICAL")
+
         if not session_key:
             self.exit_on_error(
-                f"Could not extract sessionKey from OneView SSO URL: {sso_url}", "CRITICAL")
+                "Could not obtain sessionKey after activating OneView SSO on iLO.", "CRITICAL")
 
         self.connection.set_session_key(session_key)
 
-        # Best-effort: find session location for proper logout
+        # Find the correct session location via MySession == true for proper logout
         try:
-            sessions_data = self.connection.get("/redfish/v1/SessionService/Sessions/", None)
-            if sessions_data and sessions_data.status == 200:
-                members = sessions_data.dict.get("Members", [])
-                if members:
-                    session_location = members[-1].get("@odata.id")
-                    if session_location:
-                        self.connection.set_session_location(
-                            f"https://{self.cli_args.host}{session_location}"
-                        )
+            sessions_resp = self.connection.get("/redfish/v1/SessionService/Sessions/", None)
+            if sessions_resp and sessions_resp.status == 200:
+                for member in sessions_resp.dict.get("Members", []):
+                    member_url = member.get("@odata.id")
+                    if not member_url:
+                        continue
+                    member_resp = self.connection.get(member_url, None)
+                    if member_resp and member_resp.status == 200:
+                        if member_resp.dict.get("MySession") is True:
+                            self.connection.set_session_location(
+                                f"https://{self.cli_args.host}{member_url}"
+                            )
+                            break
         except Exception:
             pass
 
@@ -680,11 +714,26 @@ class RedfishConnection:
                     f"'{self.cli_args.oneview_server}' from OneView.", "UNKNOWN")
             self.cli_args.host = ilo_host
 
-            # Now that host is known, initialise Redfish session file
+            # Now that host is known, try to restore existing Redfish session
             if self.cli_args.nosession is False:
                 self.session_file_path = self.get_session_file_name()
                 self.session_file_lock = self.session_file_path + ".lock"
                 self.restore_session_from_file()
+
+            # Validate restored session (same checks as at top of init_connection)
+            if self.connection is not None:
+                redfish_version = tuple(map(int, redfish.__version__.split(".")))
+                if len(redfish_version) >= 2 and redfish_version[0] >= 3 and redfish_version[1] >= 1:
+                    if not hasattr(self.connection, "_session"):
+                        self.connection = None
+                else:
+                    if not hasattr(self.connection, "_conn"):
+                        self.connection = None
+
+            # Valid Redfish session restored — no need for OV SSO
+            if self.connection is not None:
+                self.remove_session_lock()
+                return
 
         self.write_session_lock()
 
