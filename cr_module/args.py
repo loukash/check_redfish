@@ -40,6 +40,8 @@ def parse_command_line(description: str, version: str, version_date: str):
                        help="hostname or IP of the HPE OneView appliance")
     group.add_argument("--oneview_server",
                        help="server name (filter) in OneView to look up the iLO SSO session")
+    group.add_argument("--oneview_insecure", action='store_true',
+                       help="disable SSL certificate verification for OneView connection")
 
     group = parser.add_argument_group(title="optional arguments")
     group.add_argument("-h", "--help", action='store_true',

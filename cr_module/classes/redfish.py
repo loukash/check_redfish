@@ -404,7 +404,10 @@ class RedfishConnection:
 
         try:
             from hpeOneView.oneview_client import OneViewClient
-            ov_client = OneViewClient({"ip": ov_host})
+            ov_cfg = {"ip": ov_host}
+            if getattr(self.cli_args, "oneview_insecure", False):
+                ov_cfg["ssl_certificate"] = False
+            ov_client = OneViewClient(ov_cfg)
             ov_client.connection.set_session_id(token)
             # Validate session is still alive
             ov_client.server_hardware.get(server_uri)
@@ -453,13 +456,16 @@ class RedfishConnection:
 
         try:
             from hpeOneView.oneview_client import OneViewClient
-            ov_client = OneViewClient({
+            ov_config = {
                 "ip": self.cli_args.oneview_host,
                 "credentials": {
                     "userName": self.username,
                     "password": self.password,
                 },
-            })
+            }
+            if getattr(self.cli_args, "oneview_insecure", False):
+                ov_config["ssl_certificate"] = False
+            ov_client = OneViewClient(ov_config)
         except Exception as e:
             self.exit_on_error(
                 f"Unable to connect to OneView '{self.cli_args.oneview_host}': {e}", "CRITICAL")
